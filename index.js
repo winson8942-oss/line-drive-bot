@@ -1,138 +1,107 @@
 import express from "express";
 import line from "@line/bot-sdk";
 import fs from "fs";
+import axios from "axios";
 import { google } from "googleapis";
 
 const app = express();
 
-// LINE 設定
+// ✅ LINE Bot 設定
 const config = {
-  channelAccessToken: process.env.LINE_ACCESS_TOKEN,
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
-const client = new line.Client(config);
 
-// 建立 Google Drive 客戶端（自動偵測 OAuth / Service Account）
-async function createDriveClient() {
-  if (process.env.GDRIVE_AUTH_MODE === "oauth") {
-    console.log("🔑 Using OAuth authentication...");
-
-    const clientSecretData = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
-    const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
-    const creds = clientSecretData.installed || clientSecretData.web;
-
-    if (!creds) throw new Error("Invalid client_secret.json format.");
-
-    const { client_id, client_secret, redirect_uris } = creds;
-    const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-    oAuth2Client.setCredentials(tokenData);
-
-    return google.drive({ version: "v3", auth: oAuth2Client });
-  } else {
-    console.log("🔐 Using Service Account authentication...");
-    const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-
-    if (!serviceAccount.client_email) {
-      throw new Error("Service Account JSON missing 'client_email' field");
-    }
-
-    const auth = new google.auth.GoogleAuth({
-      credentials: serviceAccount,
-      scopes: ["https://www.googleapis.com/auth/drive.file"],
-    });
-    const authClient = await auth.getClient();
-    return google.drive({ version: "v3", auth: authClient });
-  }
-}
-
-// 初始化 Google Drive
-let drive;
-createDriveClient()
-  .then((client) => {
-    drive = client;
-    console.log("✅ Google Drive client initialized successfully");
-  })
-  .catch((err) => {
-    console.error("❌ Google Drive initialization failed:", err);
-  });
-
-// Health check
-app.get("/", (req, res) => res.status(200).send("OK"));
-
-// LINE webhook
-app.post("/webhook", line.middleware(config), async (req, res) => {
-  try {
-    await Promise.all(req.body.events.map(handleEvent));
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.sendStatus(500);
-  }
+// ✅ Google Drive 設定
+const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+const drive = google.drive({
+  version: "v3",
+  auth: new google.auth.JWT(
+    credentials.client_email,
+    null,
+    credentials.private_key,
+    ["https://www.googleapis.com/auth/drive"]
+  ),
 });
 
-// 處理收到的訊息
-async function handleEvent(event) {
-  if (event.type !== "message") return;
+// ✅ 預設上傳目錄 (主資料夾)
+const ROOT_FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
 
-  const msg = event.message;
-  const user = event.source.userId;
-  const messageId = msg.id;
-  const folderId = process.env.GDRIVE_FOLDER_ID || null;
-
-  // 只處理可下載的媒體類型
-  if (!["image", "video", "audio", "file"].includes(msg.type)) {
-    return client.replyMessage(event.replyToken, {
-      type: "text",
-      text: "請傳圖片、影片、音訊或檔案（PDF、ZIP 等），我會自動存到雲端。",
-    });
-  }
-
-  // 產生暫存檔案
-  const ext =
-    msg.type === "image"
-      ? "jpg"
-      : msg.type === "video"
-      ? "mp4"
-      : msg.type === "audio"
-      ? "m4a"
-      : "dat";
-  const fileName = msg.fileName || `${messageId}.${ext}`;
-  const tempPath = `/tmp/${fileName}`;
-
-  // 下載 LINE 檔案
-  const stream = await client.getMessageContent(messageId);
-  await new Promise((resolve, reject) => {
-    const writable = fs.createWriteStream(tempPath);
-    stream.pipe(writable);
-    writable.on("finish", resolve);
-    writable.on("error", reject);
+// 自動建立子資料夾（以群組或使用者ID命名）
+async function ensureSubFolder(parentId, name) {
+  const res = await drive.files.list({
+    q: `'${parentId}' in parents and name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: "files(id, name)",
   });
+  if (res.data.files.length > 0) return res.data.files[0].id;
 
-  // 上傳到 Google Drive
-  try {
-    const fileMetadata = {
-      name: fileName,
-      parents: folderId ? [folderId] : [],
-    };
-    const media = { body: fs.createReadStream(tempPath) };
-    const response = await drive.files.create({
-      resource: fileMetadata,
-      media: media,
-      fields: "id, name, mimeType, webViewLink",
-    });
-
-    console.log(`📂 Uploaded: ${response.data.name}`);
-    await client.replyMessage(event.replyToken, {
-      type: "text",
-      text: `✅ 已成功上傳：${response.data.name}\n📎 連結：${response.data.webViewLink}`,
-    });
-  } catch (err) {
-    console.error("❌ Drive upload failed:", err);
-    await client.replyMessage(event.replyToken, {
-      type: "text",
-      text: "上傳失敗 😢，請檢查伺服器或 Drive 權限設定。",
-    });
-  }
+  const folderMeta = {
+    name,
+    mimeType: "application/vnd.google-apps.folder",
+    parents: [parentId],
+  };
+  const folder = await drive.files.create({
+    resource: folderMeta,
+    fields: "id",
+  });
+  return folder.data.id;
 }
 
-app.listen(3000, () => console.log("🚀 LINE Bot running on port 3000"));
+// 處理上傳至 Google Drive
+async function uploadToDrive(buffer, fileName, mimeType, folderId) {
+  const res = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: [folderId],
+    },
+    media: {
+      mimeType: mimeType,
+      body: buffer,
+    },
+    fields: "id, webViewLink",
+  });
+  return res.data.webViewLink;
+}
+
+// 處理 LINE 事件
+app.post("/webhook", line.middleware(config), async (req, res) => {
+  const events = req.body.events;
+  await Promise.all(events.map(handleEvent));
+  res.status(200).end();
+});
+
+async function handleEvent(event) {
+  if (event.type !== "message" || !event.message.contentProvider) return;
+
+  const { message, source } = event;
+
+  // 決定子資料夾名稱
+  let folderName = "unknown";
+  if (source.type === "user") folderName = `user_${source.userId}`;
+  if (source.type === "group") folderName = `group_${source.groupId}`;
+  if (source.type === "room") folderName = `room_${source.roomId}`;
+
+  // 確保子資料夾存在
+  const uploadFolderId = await ensureSubFolder(ROOT_FOLDER_ID, folderName);
+
+  // 下載內容
+  const url = `https://api-data.line.me/v2/bot/message/${message.id}/content`;
+  const response = await axios.get(url, {
+    responseType: "stream",
+    headers: { Authorization: `Bearer ${config.channelAccessToken}` },
+  });
+
+  // 判斷檔案名稱與類型
+  const mimeType = message.contentProvider.type || "application/octet-stream";
+  const fileName =
+    (message.fileName || `${Date.now()}`) +
+    (mimeType.includes("/") ? `.${mimeType.split("/")[1]}` : "");
+
+  // 上傳到對應群組子資料夾
+  const link = await uploadToDrive(response.data, fileName, mimeType, uploadFolderId);
+  console.log(`✅ Uploaded ${fileName} to ${link}`);
+}
+
+// ✅ 啟動伺服器
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 LINE Bot running on port ${PORT}`));
