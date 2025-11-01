@@ -18,7 +18,6 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "Uxxxxxxxxxxxxxxxxxxxx"; // �
 // === Google Drive 初始化 ===
 async function createDriveClient() {
   if (process.env.GDRIVE_AUTH_MODE === "oauth") {
-    console.log("🪪 event.source:", event.source);
     console.log("🔑 Using OAuth authentication...");
     const clientSecretData = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
     const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
@@ -81,6 +80,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
 // === 主處理函式 ===
 async function handleEvent(event) {
+ console.log("🪪 event.source:", event.source);
   if (event.type !== "message") return;
   const msg = event.message;
   const sourceType = event.source.type;
