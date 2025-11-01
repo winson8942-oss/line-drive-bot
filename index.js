@@ -48,18 +48,50 @@ createDriveClient()
   })
   .catch((err) => console.error("❌ Drive init failed:", err));
 
-app.get("/", (req, res) => res.status(200).send("OK"));
+// === 白名單：從 Google Sheet 載入 ===
+let ALLOWED_USERS = [];
+let ALLOWED_GROUPS = [];
 
-// === 白名單設定（從 Environment 載入） ===
-const ALLOWED_USERS = process.env.ALLOWED_USERS
-  ? process.env.ALLOWED_USERS.split(",").map((id) => id.trim())
-  : [];
-const ALLOWED_GROUPS = process.env.ALLOWED_GROUPS
-  ? process.env.ALLOWED_GROUPS.split(",").map((id) => id.trim())
-  : [];
+// 讀取 Google Sheet 白名單
+async function loadWhitelistFromSheet() {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
+      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    });
+    const sheets = google.sheets({ version: "v4", auth });
+    const sheetId = process.env.WHITELIST_SHEET_ID;
 
-console.log("👥 WhiteList Users:", ALLOWED_USERS);
-console.log("👥 WhiteList Groups:", ALLOWED_GROUPS);
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: "Sheet1!A2:B", // 跳過標題列
+    });
+
+    const rows = res.data.values || [];
+    const userList = [];
+    const groupList = [];
+
+    rows.forEach(([type, id]) => {
+      if (type === "user") userList.push(id.trim());
+      if (type === "group") groupList.push(id.trim());
+    });
+
+    ALLOWED_USERS = userList;
+    ALLOWED_GROUPS = groupList;
+
+    console.log("📄 讀取 Google Sheet 白名單成功");
+    console.log("👤 Users:", ALLOWED_USERS);
+    console.log("👥 Groups:", ALLOWED_GROUPS);
+  } catch (err) {
+    console.error("❌ 無法讀取 Google Sheet 白名單:", err);
+  }
+}
+
+// 初次載入白名單
+loadWhitelistFromSheet();
+
+// 每 5 分鐘自動更新一次白名單
+setInterval(loadWhitelistFromSheet, 5 * 60 * 1000);
 
 // === 防止群組重複回覆記錄 ===
 const recentReplies = new Map(); // key = groupId / roomId, value = timestamp
@@ -180,7 +212,6 @@ async function handleEvent(event) {
     fs.unlinkSync(tempPath); // 自動刪除暫存檔
     console.log(`🧹 Temp deleted: ${tempPath}`);
 
-    // === 防止群組重複回覆 ===
     const key = groupId || userId;
     const nowTime = Date.now();
     if (!recentReplies.has(key) || nowTime - recentReplies.get(key) > 60000) {
