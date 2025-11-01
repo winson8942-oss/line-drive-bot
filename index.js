@@ -15,7 +15,7 @@ const client = new line.Client(config);
 // === 通關密語 ===
 const ACCESS_KEYWORD = process.env.ACCESS_KEYWORD || "解鎖備份";
 
-// === 管理者 ===
+// === 管理者 ID ===
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "";
 
 // === Google OAuth 初始化 ===
@@ -32,139 +32,55 @@ async function createGoogleClients() {
   const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
   oAuth2Client.setCredentials(tokenData);
 
-  // === 自動顯示目前使用的 Google 帳號 ===
+  // 顯示目前使用的 Google 帳號
   try {
     const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
     const res = await oauth2.userinfo.get();
     console.log(`👤 使用的 Google 帳號: ${res.data.email}`);
-  } catch (err) {
+  } catch {
     console.warn("⚠️ 無法讀取目前 OAuth 帳號（可能是 token 過期）");
   }
 
-  return {
-    drive: google.drive({ version: "v3", auth: oAuth2Client }),
-    sheets: google.sheets({ version: "v4", auth: oAuth2Client }),
-  };
+  return google.drive({ version: "v3", auth: oAuth2Client });
 }
 
-let drive, sheets;
+let drive;
 createGoogleClients()
-  .then((c) => {
-    drive = c.drive;
-    sheets = c.sheets;
-    console.log("✅ Google APIs ready");
-    initWhitelistSheet();
+  .then((d) => {
+    drive = d;
+    console.log("✅ Google Drive API ready");
+    initWhitelist();
   })
   .catch((err) => console.error("❌ Google API init failed:", err));
 
-// === 自動建立白名單 Sheet ===
-async function initWhitelistSheet() {
-  try {
-    if (process.env.WHITELIST_SHEET_ID) {
-      console.log("📄 已存在白名單 Sheet");
-      await loadWhitelistFromSheet();
-      return;
-    }
-
-    console.log("🆕 未設定 WHITELIST_SHEET_ID，自動建立中...");
-    const file = await drive.files.create({
-      resource: {
-        name: "LINE-Bot-Whitelist",
-        mimeType: "application/vnd.google-apps.spreadsheet",
-      },
-      fields: "id",
-    });
-
-    const sheetId = file.data.id;
-    console.log("✅ 已建立新白名單 Sheet:", sheetId);
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId,
-      range: "Sheet1!A1:C1",
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [["Type", "ID", "備註"]],
-      },
-    });
-
-    if (ADMIN_USER_ID) {
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: sheetId,
-        range: "Sheet1!A:C",
-        valueInputOption: "USER_ENTERED",
-        requestBody: {
-          values: [["user", ADMIN_USER_ID, "管理者"]],
-        },
-      });
-      console.log("👤 已自動加入管理者至白名單");
-    }
-
-    process.env.WHITELIST_SHEET_ID = sheetId;
-    await loadWhitelistFromSheet();
-  } catch (err) {
-    console.error("❌ 建立白名單 Sheet 失敗:", err);
-  }
-}
-
-// === 白名單 ===
+// === 白名單初始化（從環境變數）===
 let ALLOWED_USERS = [];
 let ALLOWED_GROUPS = [];
 
-// === 讀取 Google Sheet 白名單（v11.2 安全版） ===
-async function loadWhitelistFromSheet() {
-  try {
-    const sheetId = process.env.WHITELIST_SHEET_ID;
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range: "Sheet1!A2:B",
-    });
+function initWhitelist() {
+  ALLOWED_USERS = process.env.ALLOWED_USERS
+    ? process.env.ALLOWED_USERS.split(",").map((id) => id.trim())
+    : [];
+  ALLOWED_GROUPS = process.env.ALLOWED_GROUPS
+    ? process.env.ALLOWED_GROUPS.split(",").map((id) => id.trim())
+    : [];
 
-    const rows = res.data.values || [];
-    const users = [];
-    const groups = [];
-
-    rows.forEach((row, i) => {
-      const type = row?.[0]?.trim();
-      const id = row?.[1]?.trim();
-      if (!type || !id) {
-        console.log(`⚠️ 忽略空白列（第 ${i + 2} 列）`);
-        return;
-      }
-      if (type === "user") users.push(id);
-      if (type === "group") groups.push(id);
-    });
-
-    ALLOWED_USERS = users;
-    ALLOWED_GROUPS = groups;
-
-    console.log("📄 白名單同步完成（自動忽略空白列）");
-    console.log("👤 Users:", ALLOWED_USERS);
-    console.log("👥 Groups:", ALLOWED_GROUPS);
-  } catch (err) {
-    console.error("❌ 讀取白名單失敗:", err);
+  if (ADMIN_USER_ID && !ALLOWED_USERS.includes(ADMIN_USER_ID)) {
+    ALLOWED_USERS.push(ADMIN_USER_ID);
   }
-}
-setInterval(loadWhitelistFromSheet, 5 * 60 * 1000);
 
-// === 寫入白名單 ===
-async function addToWhitelist(type, id, name) {
-  try {
-    const sheetId = process.env.WHITELIST_SHEET_ID;
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: sheetId,
-      range: "Sheet1!A:C",
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [[type, id, name || ""]],
-      },
-    });
-    console.log(`✅ 新增白名單 (${type}): ${id}`);
-  } catch (err) {
-    console.error("❌ 寫入白名單失敗:", err);
-  }
+  console.log("📋 白名單載入完成");
+  console.log("👤 Users:", ALLOWED_USERS);
+  console.log("👥 Groups:", ALLOWED_GROUPS);
 }
 
-// === 防止群組重複回覆 ===
+// === 暫存已授權名單（通關密語）===
+const tempAuthorized = {
+  users: new Set(),
+  groups: new Set(),
+};
+
+// === 防止重複回覆 ===
 const recentReplies = new Map();
 
 // === Webhook ===
@@ -186,15 +102,16 @@ async function handleEvent(event) {
   const groupId = event.source.groupId;
   const replyToken = event.replyToken;
 
-  // === 通關密語 ===
+  // === 文字處理 ===
   if (msg?.type === "text") {
     const text = msg.text.trim();
 
-    if (sourceType === "user" && !ALLOWED_USERS.includes(userId)) {
+    // 若未授權，檢查通關密語
+    if (sourceType === "user" && !isAuthorized("user", userId)) {
       if (text === ACCESS_KEYWORD) {
         const profile = await client.getProfile(userId);
-        await addToWhitelist("user", userId, profile.displayName);
-        ALLOWED_USERS.push(userId);
+        tempAuthorized.users.add(userId);
+        console.log(`✅ 通關成功（user）: ${profile.displayName}`);
         await client.replyMessage(replyToken, {
           type: "text",
           text: "✅ 通關成功！已啟用自動備份。",
@@ -203,11 +120,11 @@ async function handleEvent(event) {
       } else return;
     }
 
-    if (sourceType === "group" && !ALLOWED_GROUPS.includes(groupId)) {
+    if (sourceType === "group" && !isAuthorized("group", groupId)) {
       if (text === ACCESS_KEYWORD) {
         const summary = await client.getGroupSummary(groupId);
-        await addToWhitelist("group", groupId, summary.groupName);
-        ALLOWED_GROUPS.push(groupId);
+        tempAuthorized.groups.add(groupId);
+        console.log(`✅ 通關成功（group）: ${summary.groupName}`);
         await client.replyMessage(replyToken, {
           type: "text",
           text: "✅ 群組通關成功！已啟用自動備份。",
@@ -219,8 +136,8 @@ async function handleEvent(event) {
 
   // === 白名單驗證 ===
   if (
-    (sourceType === "user" && !ALLOWED_USERS.includes(userId)) ||
-    (sourceType === "group" && !ALLOWED_GROUPS.includes(groupId))
+    (sourceType === "user" && !isAuthorized("user", userId)) ||
+    (sourceType === "group" && !isAuthorized("group", groupId))
   )
     return;
 
@@ -303,6 +220,12 @@ async function handleEvent(event) {
   } catch (err) {
     console.error("❌ 上傳失敗:", err);
   }
+}
+
+function isAuthorized(type, id) {
+  if (type === "user") return ALLOWED_USERS.includes(id) || tempAuthorized.users.has(id);
+  if (type === "group") return ALLOWED_GROUPS.includes(id) || tempAuthorized.groups.has(id);
+  return false;
 }
 
 app.listen(3000, () => console.log("🚀 LINE Bot running on port 3000"));
