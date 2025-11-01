@@ -5,36 +5,31 @@ import { google } from "googleapis";
 
 const app = express();
 
-// LINE 設定
+// === LINE BOT 設定 ===
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 const client = new line.Client(config);
 
-// 建立 Google Drive 客戶端（自動偵測 OAuth / Service Account）
+// === Google Drive 初始化 ===
 async function createDriveClient() {
   if (process.env.GDRIVE_AUTH_MODE === "oauth") {
     console.log("🔑 Using OAuth authentication...");
-
     const clientSecretData = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
     const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
     const creds = clientSecretData.installed || clientSecretData.web;
-
     if (!creds) throw new Error("Invalid client_secret.json format.");
 
     const { client_id, client_secret, redirect_uris } = creds;
     const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
     oAuth2Client.setCredentials(tokenData);
-
     return google.drive({ version: "v3", auth: oAuth2Client });
   } else {
     console.log("🔐 Using Service Account authentication...");
     const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-
-    if (!serviceAccount.client_email) {
-      throw new Error("Service Account JSON missing 'client_email' field");
-    }
+    if (!serviceAccount.client_email)
+      throw new Error("Service Account JSON missing client_email field");
 
     const auth = new google.auth.GoogleAuth({
       credentials: serviceAccount,
@@ -45,21 +40,20 @@ async function createDriveClient() {
   }
 }
 
-// 初始化 Google Drive
 let drive;
 createDriveClient()
-  .then((client) => {
-    drive = client;
-    console.log("✅ Google Drive client initialized successfully");
+  .then((c) => {
+    drive = c;
+    console.log("✅ Google Drive client ready");
   })
-  .catch((err) => {
-    console.error("❌ Google Drive initialization failed:", err);
-  });
+  .catch((err) => console.error("❌ Drive init failed:", err));
 
-// Health check
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-// LINE webhook
+// === 防止群組重複回覆記錄 ===
+const recentReplies = new Map(); // key = groupId / roomId, value = timestamp
+
+// === Webhook ===
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
     await Promise.all(req.body.events.map(handleEvent));
@@ -70,24 +64,20 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
-// 處理收到的訊息
 async function handleEvent(event) {
   if (event.type !== "message") return;
-
   const msg = event.message;
-  const user = event.source.userId;
+
+  if (!["image", "video", "audio", "file"].includes(msg.type)) return;
+
+  // 回覆「正在存檔中...」
+  await client.replyMessage(event.replyToken, {
+    type: "text",
+    text: "⏳正在存檔中...",
+  });
+
+  // === 下載 LINE 檔案 ===
   const messageId = msg.id;
-  const folderId = process.env.GDRIVE_FOLDER_ID || null;
-
-  // 只處理可下載的媒體類型
-  if (!["image", "video", "audio", "file"].includes(msg.type)) {
-    return client.replyMessage(event.replyToken, {
-      type: "text",
-      text: "請傳圖片、影片、音訊或檔案（PDF、ZIP 等），我會自動存到雲端。",
-    });
-  }
-
-  // 產生暫存檔案
   const ext =
     msg.type === "image"
       ? "jpg"
@@ -99,7 +89,6 @@ async function handleEvent(event) {
   const fileName = msg.fileName || `${messageId}.${ext}`;
   const tempPath = `/tmp/${fileName}`;
 
-  // 下載 LINE 檔案
   const stream = await client.getMessageContent(messageId);
   await new Promise((resolve, reject) => {
     const writable = fs.createWriteStream(tempPath);
@@ -108,77 +97,88 @@ async function handleEvent(event) {
     writable.on("error", reject);
   });
 
-  // 上傳到 Google Drive
+  // === 來源資料 ===
+  const sourceType = event.source.type;
+  let folderName = "未知聊天室";
   try {
-    // ======= 新增功能：日期命名與 LINE-bot 子資料夾 =======
+    if (sourceType === "group") {
+      const summary = await client.getGroupSummary(event.source.groupId);
+      folderName = summary.groupName || `Group-${event.source.groupId.slice(-4)}`;
+    } else if (sourceType === "room") {
+      folderName = `Room-${event.source.roomId.slice(-4)}`;
+    } else if (sourceType === "user") {
+      const profile = await client.getProfile(event.source.userId);
+      folderName = `User-${profile.displayName}`;
+    }
+  } catch {
+    console.warn("⚠️ 無法取得聊天室名稱，使用預設名稱。");
+  }
 
-// 1️⃣ 檔案加上日期編碼
-const now = new Date();
-const formattedDate = now
-  .toISOString()
-  .replace("T", "_")
-  .replace(/:/g, "-")
-  .split(".")[0]; // 例如 2025-11-01_23-14-30
-const newFileName = `${formattedDate}_${fileName}`;
+  // === 檔案命名與日期 ===
+  const now = new Date();
+  const formattedDate = now.toISOString().replace("T", "_").replace(/:/g, "-").split(".")[0];
+  const monthFolderName = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const newFileName = `${formattedDate}_${fileName}`;
 
-// 2️⃣ 找到或建立 LINE-bot 子資料夾
-let subFolderId = null;
-try {
-  // 嘗試搜尋 LINE-bot 資料夾
-  const res = await drive.files.list({
-    q: "mimeType='application/vnd.google-apps.folder' and name='LINE-bot' and trashed=false",
-    fields: "files(id, name)",
-  });
-
-  if (res.data.files.length > 0) {
-    subFolderId = res.data.files[0].id;
-  } else {
-    // 若不存在 → 自動建立
-    const folderRes = await drive.files.create({
+  // === Google Drive 資料夾結構 ===
+  const getOrCreateFolder = async (name, parentId = null) => {
+    const q =
+      `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false` +
+      (parentId ? ` and '${parentId}' in parents` : "");
+    const res = await drive.files.list({ q, fields: "files(id, name)" });
+    if (res.data.files.length > 0) return res.data.files[0].id;
+    const folder = await drive.files.create({
       resource: {
-        name: "LINE-bot",
+        name,
         mimeType: "application/vnd.google-apps.folder",
-        parents: folderId ? [folderId] : [],
+        parents: parentId ? [parentId] : [],
       },
       fields: "id",
     });
-    subFolderId = folderRes.data.id;
-    console.log("📁 Created LINE-bot folder:", subFolderId);
-  }
-} catch (err) {
-  console.error("❌ Unable to find/create LINE-bot folder:", err);
-}
+    console.log(`📁 Created folder: ${name}`);
+    return folder.data.id;
+  };
 
-// 3️⃣ 上傳到 LINE-bot 子資料夾
-const fileMetadata = {
-  name: newFileName,
-  parents: subFolderId ? [subFolderId] : folderId ? [folderId] : [],
-};
-const media = { body: fs.createReadStream(tempPath) };
+  const baseFolderId = process.env.GDRIVE_FOLDER_ID || null;
+  const lineBotFolderId = await getOrCreateFolder("LINE-bot", baseFolderId);
+  const chatFolderId = await getOrCreateFolder(folderName, lineBotFolderId);
+  const monthFolderId = await getOrCreateFolder(monthFolderName, chatFolderId);
 
-const response = await drive.files.create({
-  resource: fileMetadata,
-  media,
-  fields: "id, name, mimeType, webViewLink",
-});
-
-console.log(`📂 Uploaded: ${response.data.name}`);
-await client.replyMessage(event.replyToken, {
-  type: "text",
-  text: `✅ 已上傳到 LINE-bot 資料夾：${response.data.name}\n📎 連結：${response.data.webViewLink}`,
-});
-
-
-    console.log(`📂 Uploaded: ${response.data.name}`);
-    await client.replyMessage(event.replyToken, {
-      type: "text",
-      text: `✅ 已成功上傳：${response.data.name}}`,
+  // === 上傳檔案到 Drive ===
+  try {
+    const media = { body: fs.createReadStream(tempPath) };
+    await drive.files.create({
+      resource: { name: newFileName, parents: [monthFolderId] },
+      media,
+      fields: "id, name, webViewLink",
     });
+    console.log(`📂 Uploaded: ${newFileName}`);
+
+    // === 防止群組重複回覆 ===
+    const key =
+      event.source.groupId || event.source.roomId || event.source.userId || "unknown";
+    const nowTime = Date.now();
+
+    if (!recentReplies.has(key) || nowTime - recentReplies.get(key) > 60000) {
+      // 一分鐘內只回覆一次 ✅
+      recentReplies.set(key, nowTime);
+
+      const replyTarget =
+        event.source.userId || event.source.groupId || event.source.roomId;
+      await client.pushMessage(replyTarget, {
+        type: "text",
+        text: "✅已自動存檔",
+      });
+    } else {
+      console.log("💬 已在1分鐘內回覆過，略過重複訊息。");
+    }
   } catch (err) {
-    console.error("❌ Drive upload failed:", err);
-    await client.replyMessage(event.replyToken, {
+    console.error("❌ Upload failed:", err);
+    const replyTarget =
+      event.source.userId || event.source.groupId || event.source.roomId;
+    await client.pushMessage(replyTarget, {
       type: "text",
-      text: "上傳失敗 😢，請檢查伺服器或 Drive 權限設定。",
+      text: "上傳失敗，請稍後再試。",
     });
   }
 }
