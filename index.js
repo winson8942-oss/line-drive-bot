@@ -64,6 +64,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
+// === 主處理函式 ===
 async function handleEvent(event) {
   if (event.type !== "message") return;
   const msg = event.message;
@@ -154,15 +155,21 @@ async function handleEvent(event) {
     });
     console.log(`📂 Uploaded: ${newFileName}`);
 
+    // === 刪除暫存檔 ===
+    try {
+      fs.unlinkSync(tempPath);
+      console.log(`🧹 Deleted temp file: ${tempPath}`);
+    } catch (e) {
+      console.warn("⚠️ 無法刪除暫存檔:", e.message);
+    }
+
     // === 防止群組重複回覆 ===
     const key =
       event.source.groupId || event.source.roomId || event.source.userId || "unknown";
     const nowTime = Date.now();
 
     if (!recentReplies.has(key) || nowTime - recentReplies.get(key) > 60000) {
-      // 一分鐘內只回覆一次 ✅
       recentReplies.set(key, nowTime);
-
       const replyTarget =
         event.source.userId || event.source.groupId || event.source.roomId;
       await client.pushMessage(replyTarget, {
