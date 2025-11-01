@@ -18,20 +18,23 @@ const ACCESS_KEYWORD = process.env.ACCESS_KEYWORD || "解鎖備份";
 // === 管理者 ===
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "";
 
-// === Google API 初始化 ===
+// === Google OAuth 初始化 ===
 async function createGoogleClients() {
-  const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-  const auth = new google.auth.GoogleAuth({
-    credentials: serviceAccount,
-    scopes: [
-      "https://www.googleapis.com/auth/drive",
-      "https://www.googleapis.com/auth/spreadsheets",
-    ],
-  });
-  const authClient = await auth.getClient();
+  console.log("🔑 Using OAuth authentication...");
+
+  const clientSecretData = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
+  const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
+  const creds = clientSecretData.installed || clientSecretData.web;
+
+  if (!creds) throw new Error("Invalid client_secret.json format.");
+
+  const { client_id, client_secret, redirect_uris } = creds;
+  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+  oAuth2Client.setCredentials(tokenData);
+
   return {
-    drive: google.drive({ version: "v3", auth: authClient }),
-    sheets: google.sheets({ version: "v4", auth: authClient }),
+    drive: google.drive({ version: "v3", auth: oAuth2Client }),
+    sheets: google.sheets({ version: "v4", auth: oAuth2Client }),
   };
 }
 
@@ -98,7 +101,7 @@ async function initWhitelistSheet() {
 let ALLOWED_USERS = [];
 let ALLOWED_GROUPS = [];
 
-// === 讀取 Google Sheet 白名單 ===
+// === 讀取 Google Sheet 白名單（v11.1 安全版） ===
 async function loadWhitelistFromSheet() {
   try {
     const sheetId = process.env.WHITELIST_SHEET_ID;
@@ -106,18 +109,26 @@ async function loadWhitelistFromSheet() {
       spreadsheetId: sheetId,
       range: "Sheet1!A2:B",
     });
+
     const rows = res.data.values || [];
     const users = [];
     const groups = [];
 
-    rows.forEach(([type, id]) => {
-      if (type === "user") users.push(id.trim());
-      if (type === "group") groups.push(id.trim());
+    rows.forEach((row, i) => {
+      const type = row?.[0]?.trim();
+      const id = row?.[1]?.trim();
+      if (!type || !id) {
+        console.log(`⚠️ 忽略空白列（第 ${i + 2} 列）`);
+        return;
+      }
+      if (type === "user") users.push(id);
+      if (type === "group") groups.push(id);
     });
 
     ALLOWED_USERS = users;
     ALLOWED_GROUPS = groups;
-    console.log("📄 白名單同步完成");
+
+    console.log("📄 白名單同步完成（自動忽略空白列）");
     console.log("👤 Users:", ALLOWED_USERS);
     console.log("👥 Groups:", ALLOWED_GROUPS);
   } catch (err) {
@@ -166,11 +177,10 @@ async function handleEvent(event) {
   const groupId = event.source.groupId;
   const replyToken = event.replyToken;
 
-  // === 通關密語驗證 ===
+  // === 通關密語 ===
   if (msg?.type === "text") {
     const text = msg.text.trim();
 
-    // 個人通關
     if (sourceType === "user" && !ALLOWED_USERS.includes(userId)) {
       if (text === ACCESS_KEYWORD) {
         const profile = await client.getProfile(userId);
@@ -184,7 +194,6 @@ async function handleEvent(event) {
       } else return;
     }
 
-    // 群組通關
     if (sourceType === "group" && !ALLOWED_GROUPS.includes(groupId)) {
       if (text === ACCESS_KEYWORD) {
         const summary = await client.getGroupSummary(groupId);
