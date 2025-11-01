@@ -1,11 +1,18 @@
 {
   "name": "line-drive-bot",
-  "version": "1.0.0",
+  "version": "12.2.2",
+  "description": "LINE Bot 自動存檔到 Google Drive (OAuth + 白名單 + Reply 通知)",
   "main": "index.js",
   "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "@line/bot-sdk": "^7.5.0",
-    "express": "^4.18.2",
-    "googleapis": "^131.0.0"
+    "@line/bot-sdk": "^7.5.2",
+    "express": "^4.19.2",
+    "googleapis": "^137.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
