@@ -110,16 +110,64 @@ async function handleEvent(event) {
 
   // 上傳到 Google Drive
   try {
-    const fileMetadata = {
-      name: fileName,
-      parents: folderId ? [folderId] : [],
-    };
-    const media = { body: fs.createReadStream(tempPath) };
-    const response = await drive.files.create({
-      resource: fileMetadata,
-      media: media,
-      fields: "id, name, mimeType, webViewLink",
+    // ======= 新增功能：日期命名與 LINE-bot 子資料夾 =======
+
+// 1️⃣ 檔案加上日期編碼
+const now = new Date();
+const formattedDate = now
+  .toISOString()
+  .replace("T", "_")
+  .replace(/:/g, "-")
+  .split(".")[0]; // 例如 2025-11-01_23-14-30
+const newFileName = `${formattedDate}_${fileName}`;
+
+// 2️⃣ 找到或建立 LINE-bot 子資料夾
+let subFolderId = null;
+try {
+  // 嘗試搜尋 LINE-bot 資料夾
+  const res = await drive.files.list({
+    q: "mimeType='application/vnd.google-apps.folder' and name='LINE-bot' and trashed=false",
+    fields: "files(id, name)",
+  });
+
+  if (res.data.files.length > 0) {
+    subFolderId = res.data.files[0].id;
+  } else {
+    // 若不存在 → 自動建立
+    const folderRes = await drive.files.create({
+      resource: {
+        name: "LINE-bot",
+        mimeType: "application/vnd.google-apps.folder",
+        parents: folderId ? [folderId] : [],
+      },
+      fields: "id",
     });
+    subFolderId = folderRes.data.id;
+    console.log("📁 Created LINE-bot folder:", subFolderId);
+  }
+} catch (err) {
+  console.error("❌ Unable to find/create LINE-bot folder:", err);
+}
+
+// 3️⃣ 上傳到 LINE-bot 子資料夾
+const fileMetadata = {
+  name: newFileName,
+  parents: subFolderId ? [subFolderId] : folderId ? [folderId] : [],
+};
+const media = { body: fs.createReadStream(tempPath) };
+
+const response = await drive.files.create({
+  resource: fileMetadata,
+  media,
+  fields: "id, name, mimeType, webViewLink",
+});
+
+console.log(`📂 Uploaded: ${response.data.name}`);
+await client.replyMessage(event.replyToken, {
+  type: "text",
+  text: `✅ 已上傳到 LINE-bot 資料夾：${response.data.name}\n📎 連結：${response.data.webViewLink}`,
+});
+
 
     console.log(`📂 Uploaded: ${response.data.name}`);
     await client.replyMessage(event.replyToken, {
