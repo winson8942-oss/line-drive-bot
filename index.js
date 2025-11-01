@@ -26,11 +26,20 @@ async function createGoogleClients() {
   const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
   const creds = clientSecretData.installed || clientSecretData.web;
 
-  if (!creds) throw new Error("Invalid client_secret.json format.");
+  if (!creds) throw new Error("❌ 找不到 client_secret.json 的 installed/web 欄位。");
 
   const { client_id, client_secret, redirect_uris } = creds;
   const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
   oAuth2Client.setCredentials(tokenData);
+
+  // === 自動顯示目前使用的 Google 帳號 ===
+  try {
+    const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
+    const res = await oauth2.userinfo.get();
+    console.log(`👤 使用的 Google 帳號: ${res.data.email}`);
+  } catch (err) {
+    console.warn("⚠️ 無法讀取目前 OAuth 帳號（可能是 token 過期）");
+  }
 
   return {
     drive: google.drive({ version: "v3", auth: oAuth2Client }),
@@ -101,7 +110,7 @@ async function initWhitelistSheet() {
 let ALLOWED_USERS = [];
 let ALLOWED_GROUPS = [];
 
-// === 讀取 Google Sheet 白名單（v11.1 安全版） ===
+// === 讀取 Google Sheet 白名單（v11.2 安全版） ===
 async function loadWhitelistFromSheet() {
   try {
     const sheetId = process.env.WHITELIST_SHEET_ID;
@@ -239,7 +248,6 @@ async function handleEvent(event) {
     writable.on("error", reject);
   });
 
-  // === 分群資料夾 ===
   let folderName = "未知聊天室";
   try {
     if (sourceType === "group") {
@@ -271,7 +279,7 @@ async function handleEvent(event) {
     return folder.data.id;
   };
 
-  const baseFolder = process.env.GDRIVE_FOLDER_ID;
+  const baseFolder = process.env.GDRIVE_FOLDER_ID || null;
   const botFolder = await getOrCreateFolder("LINE-bot", baseFolder);
   const chatFolder = await getOrCreateFolder(folderName, botFolder);
   const monthFolderId = await getOrCreateFolder(monthFolder, chatFolder);
