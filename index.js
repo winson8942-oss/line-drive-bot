@@ -131,17 +131,14 @@ async function handleEvent(event) {
   }
 
   // === 白名單驗證 ===
-  if (
-    (sourceType === "user" && !allowedUsers.includes(userId)) ||
-    (sourceType === "group" && !allowedGroups.includes(groupId))
-  ) {
-    console.log("🚫 未授權使用者或群組，拒絕服務。");
-    await client.replyMessage(replyToken, {
-      type: "text",
-      text: "❌ 你沒有使用此 Bot 的權限。",
-    });
-    return;
-  }
+ if (
+  (sourceType === "user" && !ALLOWED_USERS.includes(userId)) ||
+  (sourceType === "group" && !ALLOWED_GROUPS.includes(groupId))
+) {
+  // 🚫 未授權使用者或群組（靜默忽略，不回覆）
+  console.log("🚫 未授權使用者或群組，已靜默忽略。");
+  return;
+}
 
   // === 僅處理媒體 / 檔案 ===
   if (!["image", "video", "audio", "file"].includes(msg.type)) return;
