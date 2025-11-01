@@ -12,61 +12,50 @@ const config = {
 };
 const client = new line.Client(config);
 
+// === 通關密語 ===
+const ACCESS_KEYWORD = process.env.ACCESS_KEYWORD || "解鎖備份";
+
 // === Google Drive 初始化 ===
 async function createDriveClient() {
-  if (process.env.GDRIVE_AUTH_MODE === "oauth") {
-    console.log("🔑 Using OAuth authentication...");
-    const clientSecretData = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
-    const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
-    const creds = clientSecretData.installed || clientSecretData.web;
-    if (!creds) throw new Error("Invalid client_secret.json format.");
+  const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  if (!serviceAccount.client_email)
+    throw new Error("Service Account JSON missing client_email field");
 
-    const { client_id, client_secret, redirect_uris } = creds;
-    const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-    oAuth2Client.setCredentials(tokenData);
-    return google.drive({ version: "v3", auth: oAuth2Client });
-  } else {
-    console.log("🔐 Using Service Account authentication...");
-    const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    if (!serviceAccount.client_email)
-      throw new Error("Service Account JSON missing client_email field");
-
-    const auth = new google.auth.GoogleAuth({
-      credentials: serviceAccount,
-      scopes: ["https://www.googleapis.com/auth/drive.file"],
-    });
-    const authClient = await auth.getClient();
-    return google.drive({ version: "v3", auth: authClient });
-  }
+  const auth = new google.auth.GoogleAuth({
+    credentials: serviceAccount,
+    scopes: [
+      "https://www.googleapis.com/auth/drive.file",
+      "https://www.googleapis.com/auth/spreadsheets",
+    ],
+  });
+  const authClient = await auth.getClient();
+  return {
+    drive: google.drive({ version: "v3", auth: authClient }),
+    sheets: google.sheets({ version: "v4", auth: authClient }),
+  };
 }
 
-let drive;
+let drive, sheets;
 createDriveClient()
   .then((c) => {
-    drive = c;
-    console.log("✅ Google Drive client ready");
+    drive = c.drive;
+    sheets = c.sheets;
+    console.log("✅ Google APIs ready");
   })
-  .catch((err) => console.error("❌ Drive init failed:", err));
+  .catch((err) => console.error("❌ Google API init failed:", err));
 
-// === 白名單：從 Google Sheet 載入 ===
+// === 白名單 ===
 let ALLOWED_USERS = [];
 let ALLOWED_GROUPS = [];
 
-// 讀取 Google Sheet 白名單
+// === 從 Google Sheet 載入白名單 ===
 async function loadWhitelistFromSheet() {
   try {
-    const auth = new google.auth.GoogleAuth({
-      credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
-      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-    });
-    const sheets = google.sheets({ version: "v4", auth });
     const sheetId = process.env.WHITELIST_SHEET_ID;
-
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: sheetId,
-      range: "Sheet1!A2:B", // 跳過標題列
+      range: "Sheet1!A2:B",
     });
-
     const rows = res.data.values || [];
     const userList = [];
     const groupList = [];
@@ -79,24 +68,35 @@ async function loadWhitelistFromSheet() {
     ALLOWED_USERS = userList;
     ALLOWED_GROUPS = groupList;
 
-    console.log("📄 讀取 Google Sheet 白名單成功");
+    console.log("📄 白名單已同步");
     console.log("👤 Users:", ALLOWED_USERS);
     console.log("👥 Groups:", ALLOWED_GROUPS);
   } catch (err) {
-    console.error("❌ 無法讀取 Google Sheet 白名單:", err);
+    console.error("❌ 讀取白名單失敗:", err);
+  }
+}
+loadWhitelistFromSheet();
+setInterval(loadWhitelistFromSheet, 5 * 60 * 1000); // 每 5 分鐘更新
+
+// === 寫入 Google Sheet（通關成功時） ===
+async function addToWhitelist(type, id) {
+  try {
+    const sheetId = process.env.WHITELIST_SHEET_ID;
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: sheetId,
+      range: "Sheet1!A:B",
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [[type, id]] },
+    });
+    console.log(`✅ 已寫入白名單 (${type}): ${id}`);
+  } catch (err) {
+    console.error("❌ 寫入白名單失敗:", err);
   }
 }
 
-// 初次載入白名單
-loadWhitelistFromSheet();
+// === 防止群組重複回覆 ===
+const recentReplies = new Map();
 
-// 每 5 分鐘自動更新一次白名單
-setInterval(loadWhitelistFromSheet, 5 * 60 * 1000);
-
-// === 防止群組重複回覆記錄 ===
-const recentReplies = new Map(); // key = groupId / roomId, value = timestamp
-
-// === Webhook ===
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
     await Promise.all(req.body.events.map(handleEvent));
@@ -107,34 +107,66 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
-// === 主處理函式 ===
+// === 主處理邏輯 ===
 async function handleEvent(event) {
   console.log("🪪 event.source:", event.source);
-
-  if (event.type !== "message") return;
   const msg = event.message;
   const sourceType = event.source.type;
   const userId = event.source.userId;
   const groupId = event.source.groupId;
+  const replyToken = event.replyToken;
+
+  // === 若為文字訊息，檢查通關密語 ===
+  if (msg?.type === "text") {
+    const text = msg.text.trim();
+
+    // 1️⃣ 個人通關
+    if (sourceType === "user" && !ALLOWED_USERS.includes(userId)) {
+      if (text === ACCESS_KEYWORD) {
+        await addToWhitelist("user", userId);
+        ALLOWED_USERS.push(userId);
+        await client.replyMessage(replyToken, {
+          type: "text",
+          text: "✅ 通關成功！已啟用自動備份功能。",
+        });
+        return;
+      } else {
+        console.log("🚫 未授權使用者（密語錯誤）");
+        return; // 靜默忽略
+      }
+    }
+
+    // 2️⃣ 群組通關
+    if (sourceType === "group" && !ALLOWED_GROUPS.includes(groupId)) {
+      if (text === ACCESS_KEYWORD) {
+        await addToWhitelist("group", groupId);
+        ALLOWED_GROUPS.push(groupId);
+        await client.replyMessage(replyToken, {
+          type: "text",
+          text: "✅ 群組通關成功！已啟用自動備份功能。",
+        });
+        return;
+      } else {
+        console.log("🚫 未授權群組（密語錯誤）");
+        return;
+      }
+    }
+  }
 
   // === 白名單驗證 ===
   if (
     (sourceType === "user" && !ALLOWED_USERS.includes(userId)) ||
     (sourceType === "group" && !ALLOWED_GROUPS.includes(groupId))
   ) {
-    console.log("🚫 未授權使用者或群組，已靜默忽略。");
-    return; // ⚠️ 靜默模式，不回覆
+    console.log("🚫 未授權來源，靜默忽略。");
+    return;
   }
 
-  // === 僅處理可下載媒體 ===
-  if (!["image", "video", "audio", "file"].includes(msg.type)) return;
+  // === 僅處理媒體 / 檔案 ===
+  if (!["image", "video", "audio", "file"].includes(msg?.type)) return;
 
-  await client.replyMessage(event.replyToken, {
-    type: "text",
-    text: "⏳正在存檔中...",
-  });
+  await client.replyMessage(replyToken, { type: "text", text: "⏳正在存檔中..." });
 
-  // === 檔案下載 ===
   const messageId = msg.id;
   const ext =
     msg.type === "image"
@@ -155,7 +187,7 @@ async function handleEvent(event) {
     writable.on("error", reject);
   });
 
-  // === 群組 / 使用者名稱分類 ===
+  // === 群組或使用者資料夾名稱 ===
   let folderName = "未知聊天室";
   try {
     if (sourceType === "group") {
@@ -166,16 +198,15 @@ async function handleEvent(event) {
       folderName = `User-${profile.displayName}`;
     }
   } catch {
-    console.warn("⚠️ 無法取得聊天室名稱，使用預設名稱。");
+    console.warn("⚠️ 無法取得聊天室名稱。");
   }
 
-  // === 日期命名 ===
+  // === 建立 Drive 資料夾結構 ===
   const now = new Date();
   const formattedDate = now.toISOString().replace("T", "_").replace(/:/g, "-").split(".")[0];
   const monthFolderName = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
   const newFileName = `${formattedDate}_${fileName}`;
 
-  // === Google Drive 建立層級資料夾 ===
   const getOrCreateFolder = async (name, parentId = null) => {
     const q =
       `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false` +
@@ -209,7 +240,7 @@ async function handleEvent(event) {
     });
     console.log(`📂 Uploaded: ${newFileName}`);
 
-    fs.unlinkSync(tempPath); // 自動刪除暫存檔
+    fs.unlinkSync(tempPath);
     console.log(`🧹 Temp deleted: ${tempPath}`);
 
     const key = groupId || userId;
