@@ -12,6 +12,9 @@ const config = {
 };
 const client = new line.Client(config);
 
+// === 管理員 ID（你自己） ===
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "Uxxxxxxxxxxxxxxxxxxxx"; // 改成你的 userId
+
 // === Google Drive 初始化 ===
 async function createDriveClient() {
   if (process.env.GDRIVE_AUTH_MODE === "oauth") {
@@ -50,8 +53,19 @@ createDriveClient()
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 
+// === 白名單 (由 Environment 初始化，可動態更新) ===
+let allowedUsers = process.env.ALLOWED_USERS
+  ? process.env.ALLOWED_USERS.split(",").map((id) => id.trim())
+  : [];
+let allowedGroups = process.env.ALLOWED_GROUPS
+  ? process.env.ALLOWED_GROUPS.split(",").map((id) => id.trim())
+  : [];
+
+console.log("👥 Allowed Users:", allowedUsers);
+console.log("👥 Allowed Groups:", allowedGroups);
+
 // === 防止群組重複回覆記錄 ===
-const recentReplies = new Map(); // key = groupId / roomId, value = timestamp
+const recentReplies = new Map();
 
 // === Webhook ===
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -68,16 +82,72 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 async function handleEvent(event) {
   if (event.type !== "message") return;
   const msg = event.message;
+  const sourceType = event.source.type;
+  const userId = event.source.userId;
+  const groupId = event.source.groupId;
+  const replyToken = event.replyToken;
 
+  // === 管理指令（僅限管理員） ===
+  if (msg.type === "text" && userId === ADMIN_USER_ID) {
+    const text = msg.text.trim();
+    if (text === "/info") {
+      const info = `👥 目前白名單\n\nUsers:\n${allowedUsers.join("\n") || "(無)"}\n\nGroups:\n${allowedGroups.join("\n") || "(無)"}`;
+      await client.replyMessage(replyToken, { type: "text", text: info });
+      return;
+    }
+    if (text.startsWith("/adduser")) {
+      const id = text.split(" ")[1];
+      if (id && !allowedUsers.includes(id)) {
+        allowedUsers.push(id);
+        await client.replyMessage(replyToken, { type: "text", text: `✅ 已加入使用者: ${id}` });
+      } else {
+        await client.replyMessage(replyToken, { type: "text", text: "⚠️ 無效或已存在的 UserID" });
+      }
+      return;
+    }
+    if (text.startsWith("/addgroup")) {
+      const id = text.split(" ")[1];
+      if (id && !allowedGroups.includes(id)) {
+        allowedGroups.push(id);
+        await client.replyMessage(replyToken, { type: "text", text: `✅ 已加入群組: ${id}` });
+      } else {
+        await client.replyMessage(replyToken, { type: "text", text: "⚠️ 無效或已存在的 GroupID" });
+      }
+      return;
+    }
+    if (text.startsWith("/deluser")) {
+      const id = text.split(" ")[1];
+      allowedUsers = allowedUsers.filter((u) => u !== id);
+      await client.replyMessage(replyToken, { type: "text", text: `🗑 已移除使用者: ${id}` });
+      return;
+    }
+    if (text.startsWith("/delgroup")) {
+      const id = text.split(" ")[1];
+      allowedGroups = allowedGroups.filter((g) => g !== id);
+      await client.replyMessage(replyToken, { type: "text", text: `🗑 已移除群組: ${id}` });
+      return;
+    }
+  }
+
+  // === 白名單驗證 ===
+  if (
+    (sourceType === "user" && !allowedUsers.includes(userId)) ||
+    (sourceType === "group" && !allowedGroups.includes(groupId))
+  ) {
+    console.log("🚫 未授權使用者或群組，拒絕服務。");
+    await client.replyMessage(replyToken, {
+      type: "text",
+      text: "❌ 你沒有使用此 Bot 的權限。",
+    });
+    return;
+  }
+
+  // === 僅處理媒體 / 檔案 ===
   if (!["image", "video", "audio", "file"].includes(msg.type)) return;
 
-  // 回覆「正在存檔中...」
-  await client.replyMessage(event.replyToken, {
-    type: "text",
-    text: "⏳正在存檔中...",
-  });
+  await client.replyMessage(replyToken, { type: "text", text: "⏳正在存檔中..." });
 
-  // === 下載 LINE 檔案 ===
+  // === 下載檔案 ===
   const messageId = msg.id;
   const ext =
     msg.type === "image"
@@ -98,30 +168,25 @@ async function handleEvent(event) {
     writable.on("error", reject);
   });
 
-  // === 來源資料 ===
-  const sourceType = event.source.type;
+  // === 分類資料夾 ===
   let folderName = "未知聊天室";
   try {
     if (sourceType === "group") {
-      const summary = await client.getGroupSummary(event.source.groupId);
-      folderName = summary.groupName || `Group-${event.source.groupId.slice(-4)}`;
-    } else if (sourceType === "room") {
-      folderName = `Room-${event.source.roomId.slice(-4)}`;
+      const summary = await client.getGroupSummary(groupId);
+      folderName = summary.groupName || `Group-${groupId.slice(-4)}`;
     } else if (sourceType === "user") {
-      const profile = await client.getProfile(event.source.userId);
+      const profile = await client.getProfile(userId);
       folderName = `User-${profile.displayName}`;
     }
   } catch {
     console.warn("⚠️ 無法取得聊天室名稱，使用預設名稱。");
   }
 
-  // === 檔案命名與日期 ===
   const now = new Date();
   const formattedDate = now.toISOString().replace("T", "_").replace(/:/g, "-").split(".")[0];
   const monthFolderName = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
   const newFileName = `${formattedDate}_${fileName}`;
 
-  // === Google Drive 資料夾結構 ===
   const getOrCreateFolder = async (name, parentId = null) => {
     const q =
       `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false` +
@@ -129,14 +194,9 @@ async function handleEvent(event) {
     const res = await drive.files.list({ q, fields: "files(id, name)" });
     if (res.data.files.length > 0) return res.data.files[0].id;
     const folder = await drive.files.create({
-      resource: {
-        name,
-        mimeType: "application/vnd.google-apps.folder",
-        parents: parentId ? [parentId] : [],
-      },
+      resource: { name, mimeType: "application/vnd.google-apps.folder", parents: parentId ? [parentId] : [] },
       fields: "id",
     });
-    console.log(`📁 Created folder: ${name}`);
     return folder.data.id;
   };
 
@@ -145,48 +205,27 @@ async function handleEvent(event) {
   const chatFolderId = await getOrCreateFolder(folderName, lineBotFolderId);
   const monthFolderId = await getOrCreateFolder(monthFolderName, chatFolderId);
 
-  // === 上傳檔案到 Drive ===
+  // === 上傳到 Google Drive ===
   try {
     const media = { body: fs.createReadStream(tempPath) };
     await drive.files.create({
       resource: { name: newFileName, parents: [monthFolderId] },
       media,
-      fields: "id, name, webViewLink",
+      fields: "id",
     });
-    console.log(`📂 Uploaded: ${newFileName}`);
+    fs.unlinkSync(tempPath); // 清理暫存檔
+    console.log(`📂 Uploaded & deleted temp: ${newFileName}`);
 
-    // === 刪除暫存檔 ===
-    try {
-      fs.unlinkSync(tempPath);
-      console.log(`🧹 Deleted temp file: ${tempPath}`);
-    } catch (e) {
-      console.warn("⚠️ 無法刪除暫存檔:", e.message);
-    }
-
-    // === 防止群組重複回覆 ===
-    const key =
-      event.source.groupId || event.source.roomId || event.source.userId || "unknown";
+    const key = groupId || userId;
     const nowTime = Date.now();
-
     if (!recentReplies.has(key) || nowTime - recentReplies.get(key) > 60000) {
       recentReplies.set(key, nowTime);
-      const replyTarget =
-        event.source.userId || event.source.groupId || event.source.roomId;
-      await client.pushMessage(replyTarget, {
-        type: "text",
-        text: "✅已自動存檔",
-      });
-    } else {
-      console.log("💬 已在1分鐘內回覆過，略過重複訊息。");
+      const replyTarget = userId || groupId;
+      await client.pushMessage(replyTarget, { type: "text", text: "✅已自動存檔" });
     }
   } catch (err) {
     console.error("❌ Upload failed:", err);
-    const replyTarget =
-      event.source.userId || event.source.groupId || event.source.roomId;
-    await client.pushMessage(replyTarget, {
-      type: "text",
-      text: "上傳失敗，請稍後再試。",
-    });
+    await client.pushMessage(userId || groupId, { type: "text", text: "上傳失敗，請稍後再試。" });
   }
 }
 
