@@ -16,10 +16,9 @@ const client = new line.Client(config);
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "Uxxxxxxxxxxxxxxxxxxxx"; // 改成你的 userId
 
 // === Google Drive 初始化 ===
-console.log("🪪 event.source:", event.source);
-
 async function createDriveClient() {
   if (process.env.GDRIVE_AUTH_MODE === "oauth") {
+    console.log("🪪 event.source:", event.source);
     console.log("🔑 Using OAuth authentication...");
     const clientSecretData = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
     const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
