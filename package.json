@@ -1,7 +1,7 @@
 {
   "name": "line-drive-bot",
-  "version": "12.2.2",
-  "description": "LINE Bot 自動存檔到 Google Drive (OAuth + 白名單 + Reply 通知)",
+  "version": "13.0.0",
+  "description": "LINE Drive Bot - Dual Cloud (Google Drive + OneDrive)",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -10,9 +10,13 @@
   "dependencies": {
     "@line/bot-sdk": "^7.5.2",
     "express": "^4.19.2",
-    "googleapis": "^137.0.0"
+    "googleapis": "^126.0.1",
+    "@microsoft/microsoft-graph-client": "^3.0.4",
+    "isomorphic-fetch": "^3.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "author": "Winson",
+  "license": "MIT"
 }
