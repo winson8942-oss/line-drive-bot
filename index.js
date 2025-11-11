@@ -1,265 +1,368 @@
+// ======================================================
+// 🚀 LINE Drive Bot v13.0 - Google / OneDrive 雙雲端備份
+// ======================================================
 import express from "express";
 import line from "@line/bot-sdk";
 import fs from "fs";
 import { google } from "googleapis";
+import { Client as MsClient } from "@microsoft/microsoft-graph-client";
+import "isomorphic-fetch";
 
 const app = express();
 
-// === LINE BOT 設定 ===
+// --- LINE 設定 ---
 const config = {
-  channelAccessToken: process.env.LINE_ACCESS_TOKEN,
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 const client = new line.Client(config);
 
-// === 通關密語與管理者 ===
+// --- 系統參數 ---
+const DRIVE_MODE = (process.env.DRIVE_MODE || "google").toLowerCase(); // google | onedrive | both
 const ACCESS_KEYWORD = process.env.ACCESS_KEYWORD || "解鎖備份";
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "";
+const BOT_ROOT = "LINE-bot";
+const BATCH_MS = 2000;
 
-// === Google OAuth 初始化 ===
-async function createGoogleClients() {
-  console.log("🔑 Using OAuth authentication...");
+// --- 暫存上傳列表（2 秒合併訊息）---
+const uploadBuffer = new Map();
 
-  const clientSecretData = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
-  const tokenData = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
-  const creds = clientSecretData.installed || clientSecretData.web;
-
-  if (!creds) throw new Error("❌ 找不到 client_secret.json 的 installed/web 欄位。");
-
-  const { client_id, client_secret, redirect_uris } = creds;
-  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-  oAuth2Client.setCredentials(tokenData);
-
-  try {
-    const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client });
-    const res = await oauth2.userinfo.get();
-    console.log(`👤 使用的 Google 帳號: ${res.data.email}`);
-  } catch {
-    console.warn("⚠️ 無法讀取目前 OAuth 帳號（可能是 token 過期）");
-  }
-
-  return google.drive({ version: "v3", auth: oAuth2Client });
+// ===============================
+// ⏰ 時間字串 (+8 台灣時區)
+// ===============================
+function tsPrefix() {
+  const now = new Date();
+  const local = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const y = local.getFullYear();
+  const m = String(local.getMonth() + 1).padStart(2, "0");
+  const d = String(local.getDate()).padStart(2, "0");
+  const hh = String(local.getHours()).padStart(2, "0");
+  const mm = String(local.getMinutes()).padStart(2, "0");
+  const ss = String(local.getSeconds()).padStart(2, "0");
+  return `${y}-${m}-${d}_${hh}-${mm}-${ss}`;
 }
 
-let drive;
-let whitelistFileId = null;
-let ALLOWED_USERS = [];
-let ALLOWED_GROUPS = [];
+// ===============================
+// 🧩 批次回覆處理
+// ===============================
+function scheduleReply(chatId, replyToken, name, type) {
+  let buf = uploadBuffer.get(chatId);
+  if (!buf) {
+    buf = { items: [], timer: null, lastReplyToken: replyToken };
+    uploadBuffer.set(chatId, buf);
+  }
+  buf.items.push({ name, type });
+  buf.lastReplyToken = replyToken;
 
-// 初始化 Google Drive 與白名單
-createGoogleClients()
-  .then(async (d) => {
-    drive = d;
-    console.log("✅ Google Drive API ready");
-    await loadWhitelist();
-  })
-  .catch((err) => console.error("❌ Google API init failed:", err));
-
-// === 載入 / 建立 whitelist.json ===
-async function loadWhitelist() {
-  try {
-    const botFolderId = await getOrCreateFolder("LINE-bot");
-    const files = await drive.files.list({
-      q: `'${botFolderId}' in parents and name='whitelist.json' and trashed=false`,
-      fields: "files(id, name)",
-    });
-
-    let fileId;
-    if (files.data.files.length === 0) {
-      console.log("📄 未找到 whitelist.json，建立中...");
-      const whitelistData = {
-        users: ADMIN_USER_ID ? [ADMIN_USER_ID] : [],
-        groups: [],
-      };
-      const media = {
-        mimeType: "application/json",
-        body: JSON.stringify(whitelistData, null, 2),
-      };
-      const file = await drive.files.create({
-        resource: { name: "whitelist.json", parents: [botFolderId] },
-        media,
-        fields: "id",
-      });
-      fileId = file.data.id;
-      console.log("✅ 已建立 whitelist.json:", fileId);
-    } else {
-      fileId = files.data.files[0].id;
-      console.log("📄 已找到 whitelist.json");
+  if (buf.timer) clearTimeout(buf.timer);
+  buf.timer = setTimeout(async () => {
+    const { items, lastReplyToken } = buf;
+    if (!items.length) return;
+    const grouped = { image: [], video: [], audio: [], file: [] };
+    for (const it of items) (grouped[it.type] || grouped.file).push(it.name);
+    let text = "✅ 已自動存檔：";
+    if (grouped.image.length)
+      text += "\n\n🖼️ 圖片：\n" + grouped.image.map((n) => `- ${n}`).join("\n");
+    if (grouped.video.length)
+      text += "\n\n🎬 影片：\n" + grouped.video.map((n) => `- ${n}`).join("\n");
+    if (grouped.audio.length)
+      text += "\n\n🎵 音訊：\n" + grouped.audio.map((n) => `- ${n}`).join("\n");
+    if (grouped.file.length)
+      text += "\n\n📄 檔案：\n" + grouped.file.map((n) => `- ${n}`).join("\n");
+    try {
+      await client.replyMessage(lastReplyToken, { type: "text", text });
+    } catch (e) {
+      console.error("Reply failed:", e?.response?.data || e);
     }
+    uploadBuffer.delete(chatId);
+  }, BATCH_MS);
+}
 
-    const res = await drive.files.get({ fileId, alt: "media" });
-    const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
-    ALLOWED_USERS = data.users || [];
-    ALLOWED_GROUPS = data.groups || [];
-    whitelistFileId = fileId;
+// ===============================
+// ☁️ Google Drive
+// ===============================
+let drive = null;
+let whitelistFileId = null;
 
-    console.log("📋 白名單載入完成");
-  } catch (err) {
-    console.error("❌ 讀取白名單失敗:", err);
+async function initGoogle() {
+  const cs = JSON.parse(process.env.GOOGLE_CLIENT_SECRET_JSON);
+  const tk = JSON.parse(process.env.GOOGLE_OAUTH_TOKEN_JSON);
+  const creds = cs.installed || cs.web;
+  const { client_id, client_secret, redirect_uris } = creds;
+  const oauth = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+  oauth.setCredentials(tk);
+  drive = google.drive({ version: "v3", auth: oauth });
+  console.log("✅ Google Drive ready");
+}
+
+async function getOrCreateFolder_G(name, parentId = null) {
+  const q = `mimeType='application/vnd.google-apps.folder' and name='${name.replace(/'/g, "\\'")}' and trashed=false` +
+    (parentId ? ` and '${parentId}' in parents` : "");
+  const r = await drive.files.list({ q, fields: "files(id,name)" });
+  if (r.data.files.length) return r.data.files[0].id;
+  const f = await drive.files.create({
+    resource: { name, mimeType: "application/vnd.google-apps.folder", parents: parentId ? [parentId] : [] },
+    fields: "id",
+  });
+  return f.data.id;
+}
+
+async function ensureWhitelist_G() {
+  const botId = await getOrCreateFolder_G(BOT_ROOT);
+  const r = await drive.files.list({
+    q: `'${botId}' in parents and name='whitelist.json' and trashed=false`,
+    fields: "files(id,name)",
+  });
+  if (!r.data.files.length) {
+    const init = { users: ADMIN_USER_ID ? [ADMIN_USER_ID] : [], groups: [] };
+    const f = await drive.files.create({
+      resource: { name: "whitelist.json", parents: [botId] },
+      media: { mimeType: "application/json", body: JSON.stringify(init, null, 2) },
+      fields: "id",
+    });
+    whitelistFileId = f.data.id;
+  } else whitelistFileId = r.data.files[0].id;
+}
+
+async function loadWhitelist_G() {
+  const res = await drive.files.get({ fileId: whitelistFileId, alt: "media" });
+  const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
+  return { users: data.users || [], groups: data.groups || [] };
+}
+
+async function saveWhitelist_G(users, groups) {
+  const body = JSON.stringify({ users, groups }, null, 2);
+  await drive.files.update({
+    fileId: whitelistFileId,
+    media: { mimeType: "application/json", body },
+  });
+}
+
+async function uploadToGoogle(folderName, newFileName, tmpPath) {
+  const botId = await getOrCreateFolder_G(BOT_ROOT);
+  const chatId = await getOrCreateFolder_G(folderName, botId);
+  let finalName = newFileName, idx = 1;
+  while (true) {
+    const r = await drive.files.list({
+      q: `'${chatId}' in parents and name='${finalName}' and trashed=false`,
+      fields: "files(id,name)",
+    });
+    if (!r.data.files.length) break;
+    const dot = newFileName.lastIndexOf(".");
+    const base = dot > 0 ? newFileName.slice(0, dot) : newFileName;
+    const ext = dot > 0 ? newFileName.slice(dot) : "";
+    finalName = `${base}_${idx}${ext}`; idx++;
+  }
+  await drive.files.create({
+    resource: { name: finalName, parents: [chatId] },
+    media: { body: fs.createReadStream(tmpPath) },
+    fields: "id",
+  });
+}
+
+// ===============================
+// ☁️ OneDrive (Microsoft Graph)
+// ===============================
+let graph = null;
+
+async function initOneDrive() {
+  async function refreshToken() {
+    const tenant = process.env.ONEDRIVE_TENANT_ID || "common";
+    const cid = process.env.ONEDRIVE_CLIENT_ID;
+    const csec = process.env.ONEDRIVE_CLIENT_SECRET;
+    const refresh = process.env.ONEDRIVE_REFRESH_TOKEN;
+    const params = new URLSearchParams();
+    params.append("client_id", cid);
+    params.append("client_secret", csec);
+    params.append("grant_type", "refresh_token");
+    params.append("refresh_token", refresh);
+    params.append("scope", "Files.ReadWrite User.Read offline_access");
+    const resp = await fetch(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
+      method: "POST", body: params,
+    });
+    const data = await resp.json();
+    if (!data.access_token)
+      throw new Error("OneDrive token refresh failed: " + JSON.stringify(data));
+    return data.access_token;
+  }
+  const accessToken = await refreshToken();
+  graph = MsClient.init({ authProvider: (done) => done(null, accessToken) });
+  console.log("✅ OneDrive ready");
+}
+
+function enc(s) { return encodeURIComponent(s).replace(/%2F/g, "%2F"); }
+
+async function ensurePath_OD(parts) {
+  let curr = "";
+  for (const p of parts) {
+    curr = curr ? `${curr}/${p}` : p;
+    try { await graph.api(`/me/drive/root:/${enc(curr)}`).get(); }
+    catch { await graph.api(`/me/drive/root:/${enc(curr)}`).put({ folder: {}, "@microsoft.graph.conflictBehavior": "rename" }); }
   }
 }
 
-// === 儲存白名單 ===
-async function saveWhitelist() {
-  try {
-    if (!whitelistFileId) return;
-    const newData = { users: ALLOWED_USERS, groups: ALLOWED_GROUPS };
-    const media = { mimeType: "application/json", body: JSON.stringify(newData, null, 2) };
-    await drive.files.update({ fileId: whitelistFileId, media });
-    console.log("💾 白名單已更新");
-  } catch (err) {
-    console.error("❌ 無法更新白名單:", err);
+async function exists_OD(path) {
+  try { await graph.api(`/me/drive/root:/${enc(path)}`).get(); return true; }
+  catch { return false; }
+}
+
+async function uploadToOneDrive(folderName, newFileName, tmpPath) {
+  await ensurePath_OD([BOT_ROOT, folderName]);
+  let finalName = newFileName, idx = 1;
+  const basePath = `${BOT_ROOT}/${folderName}`;
+  while (await exists_OD(`${basePath}/${finalName}`)) {
+    const dot = newFileName.lastIndexOf(".");
+    const base = dot > 0 ? newFileName.slice(0, dot) : newFileName;
+    const ext = dot > 0 ? newFileName.slice(dot) : "";
+    finalName = `${base}_${idx}${ext}`; idx++;
+  }
+  await graph.api(`/me/drive/root:/${enc(basePath)}/${enc(finalName)}:/content`)
+    .put(fs.createReadStream(tmpPath));
+}
+
+// ===============================
+// 🔐 白名單
+// ===============================
+let ALLOWED_USERS = [], ALLOWED_GROUPS = [];
+
+async function ensureWhitelist() {
+  if (DRIVE_MODE === "google" || DRIVE_MODE === "both") {
+    await initGoogle(); await ensureWhitelist_G();
+    const w = await loadWhitelist_G();
+    ALLOWED_USERS = w.users; ALLOWED_GROUPS = w.groups;
+  }
+  if (DRIVE_MODE === "onedrive") {
+    await initOneDrive();
+    if (!ALLOWED_USERS.length && ADMIN_USER_ID) ALLOWED_USERS = [ADMIN_USER_ID];
   }
 }
 
-// === 處理 LINE webhook ===
+function isAuth(kind, id) {
+  return kind === "user" ? ALLOWED_USERS.includes(id) : ALLOWED_GROUPS.includes(id);
+}
+
+// ===============================
+// 🧠 LINE Webhook
+// ===============================
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
     await Promise.all(req.body.events.map(handleEvent));
     res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
+  } catch (e) {
+    console.error("Webhook error:", e?.response?.data || e);
     res.sendStatus(500);
   }
 });
 
+function chatKey(e) {
+  return e.source.groupId || e.source.userId || e.source.roomId || "unknown";
+}
+
 async function handleEvent(event) {
   const msg = event.message;
-  const sourceType = event.source.type;
+  const type = msg?.type;
+  const srcType = event.source.type;
   const userId = event.source.userId;
   const groupId = event.source.groupId;
   const replyToken = event.replyToken;
 
-  // === 管理指令 ===
-  if (msg?.type === "text" && userId === ADMIN_USER_ID) {
+  // === 管理員指令 ===
+  if (type === "text" && userId === ADMIN_USER_ID) {
     const text = msg.text.trim();
     if (text === "白名單列表") {
-      let reply = "👤 使用者：\n" + (ALLOWED_USERS.length ? ALLOWED_USERS.join("\n") : "(無)") +
-                  "\n\n👥 群組：\n" + (ALLOWED_GROUPS.length ? ALLOWED_GROUPS.join("\n") : "(無)");
-      await client.replyMessage(replyToken, { type: "text", text: reply });
-      return;
+      const reply = `👤 使用者：\n${ALLOWED_USERS.join("\n") || "(無)"}\n\n👥 群組：\n${ALLOWED_GROUPS.join("\n") || "(無)"}`;
+      await client.replyMessage(replyToken, { type: "text", text: reply }); return;
     }
     if (text.startsWith("踢出 ")) {
       const target = text.replace("踢出 ", "").trim();
       if (target === "全部") {
-        ALLOWED_USERS = [ADMIN_USER_ID];
-        ALLOWED_GROUPS = [];
-        await saveWhitelist();
+        ALLOWED_USERS = [ADMIN_USER_ID]; ALLOWED_GROUPS = [];
+        if (drive) await saveWhitelist_G(ALLOWED_USERS, ALLOWED_GROUPS);
         await client.replyMessage(replyToken, { type: "text", text: "⚠️ 已清空白名單（保留管理者）" });
         return;
       }
-      const beforeUsers = ALLOWED_USERS.length, beforeGroups = ALLOWED_GROUPS.length;
-      ALLOWED_USERS = ALLOWED_USERS.filter((id) => id !== target);
-      ALLOWED_GROUPS = ALLOWED_GROUPS.filter((id) => id !== target);
-      await saveWhitelist();
-      const changed = beforeUsers !== ALLOWED_USERS.length || beforeGroups !== ALLOWED_GROUPS.length;
-      await client.replyMessage(replyToken, { type: "text", text: changed ? `✅ 已從白名單移除 ${target}` : "❌ 找不到此 ID" });
+      ALLOWED_USERS = ALLOWED_USERS.filter(id => id !== target);
+      ALLOWED_GROUPS = ALLOWED_GROUPS.filter(id => id !== target);
+      if (drive) await saveWhitelist_G(ALLOWED_USERS, ALLOWED_GROUPS);
+      await client.replyMessage(replyToken, { type: "text", text: `✅ 已從白名單移除 ${target}` });
       return;
     }
   }
 
   // === 通關密語 ===
-  if (msg?.type === "text") {
+  if (type === "text") {
     const text = msg.text.trim();
-    if (sourceType === "user" && !isAuthorized("user", userId)) {
+    if (srcType === "user" && !isAuth("user", userId)) {
       if (text === ACCESS_KEYWORD) {
         ALLOWED_USERS.push(userId);
-        await saveWhitelist();
+        if (drive) await saveWhitelist_G(ALLOWED_USERS, ALLOWED_GROUPS);
         await client.replyMessage(replyToken, { type: "text", text: "✅ 通關成功！已加入永久白名單。" });
-        return;
-      } else return;
+      }
+      return;
     }
-    if (sourceType === "group" && !isAuthorized("group", groupId)) {
+    if (srcType === "group" && !isAuth("group", groupId)) {
       if (text === ACCESS_KEYWORD) {
         ALLOWED_GROUPS.push(groupId);
-        await saveWhitelist();
+        if (drive) await saveWhitelist_G(ALLOWED_USERS, ALLOWED_GROUPS);
         await client.replyMessage(replyToken, { type: "text", text: "✅ 群組通關成功！已加入永久白名單。" });
-        return;
-      } else return;
+      }
+      return;
     }
   }
 
-  if (
-    (sourceType === "user" && !isAuthorized("user", userId)) ||
-    (sourceType === "group" && !isAuthorized("group", groupId))
-  )
-    return;
-
-  if (!["image", "video", "audio", "file"].includes(msg?.type)) return;
+  // === 權限 / 檔案處理 ===
+  if ((srcType === "user" && !isAuth("user", userId)) ||
+      (srcType === "group" && !isAuth("group", groupId))) return;
+  if (!["image", "video", "audio", "file"].includes(type)) return;
 
   const messageId = msg.id;
-  const ext =
-    msg.type === "image"
-      ? "jpg"
-      : msg.type === "video"
-      ? "mp4"
-      : msg.type === "audio"
-      ? "m4a"
-      : "dat";
+  const ext = type === "image" ? "jpg" : type === "video" ? "mp4" : type === "audio" ? "m4a" : "dat";
   const fileName = msg.fileName || `${messageId}.${ext}`;
-  const tempPath = `/tmp/${fileName}`;
-
+  const tmp = `/tmp/${fileName}`;
   const stream = await client.getMessageContent(messageId);
   await new Promise((resolve, reject) => {
-    const writable = fs.createWriteStream(tempPath);
-    stream.pipe(writable);
-    writable.on("finish", resolve);
-    writable.on("error", reject);
+    const w = fs.createWriteStream(tmp);
+    stream.pipe(w);
+    w.on("finish", resolve);
+    w.on("error", reject);
   });
 
   let folderName = "未知聊天室";
   try {
-    if (sourceType === "group") {
-      const summary = await client.getGroupSummary(groupId);
-      folderName = summary.groupName || `Group-${groupId.slice(-4)}`;
-    } else if (sourceType === "user") {
-      const profile = await client.getProfile(userId);
-      folderName = `User-${profile.displayName}`;
+    if (srcType === "group") {
+      const s = await client.getGroupSummary(groupId);
+      folderName = s.groupName || `Group-${groupId.slice(-4)}`;
+    } else {
+      const p = await client.getProfile(userId);
+      folderName = `User-${p.displayName}`;
     }
-  } catch {
-    console.warn("⚠️ 無法取得名稱");
-  }
+  } catch {}
 
-  // === 台灣時間 UTC+8 命名 ===
-  const now = new Date();
-  const local = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  const formatted = `${local.getFullYear()}-${String(local.getMonth() + 1).padStart(2, "0")}-${String(local.getDate()).padStart(2, "0")}_${String(local.getHours()).padStart(2, "0")}-${String(local.getMinutes()).padStart(2, "0")}-${String(local.getSeconds()).padStart(2, "0")}`;
-  const newFileName = `${formatted}_${fileName}`;
-
-  const botFolder = await getOrCreateFolder("LINE-bot");
-  const chatFolder = await getOrCreateFolder(folderName, botFolder);
+  const newFileName = `${tsPrefix()}_${fileName}`;
 
   try {
-    const media = { body: fs.createReadStream(tempPath) };
-    await drive.files.create({
-      resource: { name: newFileName, parents: [chatFolder] },
-      media,
-      fields: "id",
-    });
-    fs.unlinkSync(tempPath);
-    console.log(`✅ 上傳完成: ${newFileName}`);
-    await client.replyMessage(replyToken, { type: "text", text: `✅存檔：${fileName}` });
-  } catch (err) {
-    console.error("❌ 上傳失敗:", err);
+    if (DRIVE_MODE === "google" || DRIVE_MODE === "both")
+      await uploadToGoogle(folderName, newFileName, tmp);
+    if (DRIVE_MODE === "onedrive" || DRIVE_MODE === "both") {
+      if (!graph) await initOneDrive();
+      await uploadToOneDrive(folderName, newFileName, tmp);
+    }
+    fs.unlinkSync(tmp);
+    const key = chatKey(event);
+    scheduleReply(key, replyToken, fileName, type);
+  } catch (e) {
+    console.error("Upload failed:", e?.response?.data || e);
   }
 }
 
-function isAuthorized(type, id) {
-  if (type === "user") return ALLOWED_USERS.includes(id);
-  if (type === "group") return ALLOWED_GROUPS.includes(id);
-  return false;
-}
-
-async function getOrCreateFolder(name, parentId = null) {
-  const q = `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false` +
-    (parentId ? ` and '${parentId}' in parents` : "");
-  const res = await drive.files.list({ q, fields: "files(id, name)" });
-  if (res.data.files.length > 0) return res.data.files[0].id;
-  const folder = await drive.files.create({
-    resource: { name, mimeType: "application/vnd.google-apps.folder", parents: parentId ? [parentId] : [] },
-    fields: "id",
+// ===============================
+// 🚀 啟動服務
+// ===============================
+ensureWhitelist()
+  .then(() => {
+    app.listen(3000, () => console.log("🚀 v13.0 dual-cloud running on 3000"));
+  })
+  .catch((e) => {
+    console.error("Init failed:", e);
+    app.listen(3000, () => console.log("🚀 v13.0 dual-cloud started (with warnings)"));
   });
-  return folder.data.id;
-}
-
-app.listen(3000, () => console.log("🚀 LINE Bot running on port 3000"));
